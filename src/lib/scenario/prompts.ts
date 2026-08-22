@@ -34,9 +34,9 @@ environment while making the worsening emergency visually
 obvious.`;
 
 export const OBJECTIVES = {
-    low: "Investigate the reported smoke and assess the situation.",
-    high: "Conditions are deteriorating. Determine an appropriate response and prepare to evacuate.",
-    critical: "Conditions are severe. Immediate evacuation is recommended.",
-    complete: "Simulation complete. Review your response.",
-    briefing: "Review the briefing, then start the simulation.",
+  low: "Investigate the reported smoke and assess the situation.",
+  high: "Conditions are deteriorating. Determine an appropriate response and prepare to evacuate.",
+  critical: "Conditions are severe. Immediate evacuation is recommended.",
+  complete: "Simulation complete. Review your response.",
+  briefing: "Review the briefing, then start the simulation.",
 } as const;
