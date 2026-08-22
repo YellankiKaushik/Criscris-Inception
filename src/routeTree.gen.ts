@@ -10,60 +10,78 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as ApiReactorTokenRouteImport } from './routes/api/reactor-token'
 
 const IndexRoute = IndexRouteImport.update({
-    id: '/',
-    path: '/',
-    getParentRoute: () => rootRouteImport,
+  id: '/',
+  path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const ApiReactorTokenRoute = ApiReactorTokenRouteImport.update({
+  id: '/api/reactor-token',
+  path: '/api/reactor-token',
+  getParentRoute: () => rootRouteImport,
 } as any)
 
 export interface FileRoutesByFullPath {
-    '/': typeof IndexRoute
+  '/': typeof IndexRoute
+  '/api/reactor-token': typeof ApiReactorTokenRoute
 }
 export interface FileRoutesByTo {
-    '/': typeof IndexRoute
+  '/': typeof IndexRoute
+  '/api/reactor-token': typeof ApiReactorTokenRoute
 }
 export interface FileRoutesById {
-    __root__: typeof rootRouteImport
-    '/': typeof IndexRoute
+  __root__: typeof rootRouteImport
+  '/': typeof IndexRoute
+  '/api/reactor-token': typeof ApiReactorTokenRoute
 }
 export interface FileRouteTypes {
-    fileRoutesByFullPath: FileRoutesByFullPath
-    fullPaths: '/'
-    fileRoutesByTo: FileRoutesByTo
-    to: '/'
-    id: '__root__' | '/'
-    fileRoutesById: FileRoutesById
+  fileRoutesByFullPath: FileRoutesByFullPath
+  fullPaths: '/' | '/api/reactor-token'
+  fileRoutesByTo: FileRoutesByTo
+  to: '/' | '/api/reactor-token'
+  id: '__root__' | '/' | '/api/reactor-token'
+  fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
-    IndexRoute: typeof IndexRoute
+  IndexRoute: typeof IndexRoute
+  ApiReactorTokenRoute: typeof ApiReactorTokenRoute
 }
 
 declare module '@tanstack/react-router' {
-    interface FileRoutesByPath {
-        '/': {
-            id: '/'
-            path: '/'
-            fullPath: '/'
-            preLoaderRoute: typeof IndexRouteImport
-            parentRoute: typeof rootRouteImport
-        }
+  interface FileRoutesByPath {
+    '/': {
+      id: '/'
+      path: '/'
+      fullPath: '/'
+      preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
     }
+    '/api/reactor-token': {
+      id: '/api/reactor-token'
+      path: '/api/reactor-token'
+      fullPath: '/api/reactor-token'
+      preLoaderRoute: typeof ApiReactorTokenRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+  }
 }
 
 const rootRouteChildren: RootRouteChildren = {
-    IndexRoute: IndexRoute,
+  IndexRoute: IndexRoute,
+  ApiReactorTokenRoute: ApiReactorTokenRoute,
 }
 export const routeTree = rootRouteImport
-    ._addFileChildren(rootRouteChildren)
-    ._addFileTypes<FileRouteTypes>()
+  ._addFileChildren(rootRouteChildren)
+  ._addFileTypes<FileRouteTypes>()
 
 import type { getRouter } from './router.tsx'
 import type { startInstance } from './start.ts'
 declare module '@tanstack/react-start' {
-    interface Register {
-        ssr: true
-        router: Awaited<ReturnType<typeof getRouter>>
-        config: Awaited<ReturnType<typeof startInstance.getOptions>>
-    }
+  interface Register {
+    ssr: true
+    router: Awaited<ReturnType<typeof getRouter>>
+    config: Awaited<ReturnType<typeof startInstance.getOptions>>
+  }
 }
