@@ -7,17 +7,16 @@ import { useSimulation } from "@/hooks/useSimulation";
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Criscris - Warehouse Fire Emergency Response Simulation" },
+      { title: "Criscris — Emergency Response Simulation" },
       {
         name: "description",
-        content:
-          "Criscris is an interactive world-model simulation that scores emergency decision-making during an escalating industrial warehouse fire.",
+        content: "Interactive emergency-response simulation powered by real-time world models.",
       },
-      { property: "og:title", content: "Criscris - Emergency Response Simulation" },
+      { name: "author", content: "Kaushik Yellanki" },
+      { property: "og:title", content: "Criscris — Emergency Response Simulation" },
       {
         property: "og:description",
-        content:
-          "Run a warehouse fire scenario, take response actions under escalating hazard, and get a deterministic decision score out of 100.",
+        content: "Interactive emergency-response simulation powered by real-time world models.",
       },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
