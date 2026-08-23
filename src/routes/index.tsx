@@ -28,10 +28,10 @@ export const Route = createFileRoute("/")({
 
 function Index() {
   const simulation = useSimulation();
-  const { state, score, start, restart, switchToDemo, providerKind } = simulation;
+  const { state, score, recording, start, restart, switchToDemo, providerKind } = simulation;
 
   if (state.status === "complete" && score) {
-    return <DebriefView state={state} score={score} onRestart={restart} />;
+    return <DebriefView state={state} score={score} recording={recording} onRestart={restart} />;
   }
 
   if (state.status === "running" || state.status === "starting") {

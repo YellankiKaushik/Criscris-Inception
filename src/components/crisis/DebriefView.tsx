@@ -1,3 +1,17 @@
+import { useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import type { SimulationRecordingState } from "@/hooks/useSimulation";
+import {
+  createSimulationReportPdf,
+  createSupervisorEmailBody,
+  downloadBlob,
+  formatCompletionDateTime,
+  formatDuration,
+  formatEvidenceTimestamp,
+  formatOutcome,
+  getRecordingExtension,
+} from "@/lib/export/simulationEvidence";
 import { scoreBand, type ScoreBreakdown } from "@/lib/scenario/scoring";
 import { ACTION_LABELS, type SimulationState } from "@/lib/scenario/types";
 import { cn } from "@/lib/utils";
@@ -5,18 +19,21 @@ import { cn } from "@/lib/utils";
 interface DebriefViewProps {
   state: SimulationState;
   score: ScoreBreakdown;
+  recording: SimulationRecordingState;
   onRestart: () => void;
 }
 
-function formatTime(seconds: number) {
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+function isValidEmail(value: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim());
 }
 
-export function DebriefView({ state, score, onRestart }: DebriefViewProps) {
+export function DebriefView({ state, score, recording, onRestart }: DebriefViewProps) {
   const band = scoreBand(score.total);
   const evacuation = state.actions.find((a) => a.type === "evacuate");
+  const [supervisorEmail, setSupervisorEmail] = useState("");
+  const [emailError, setEmailError] = useState<string | null>(null);
+  const [reportError, setReportError] = useState<string | null>(null);
+  const evidenceTimestamp = formatEvidenceTimestamp(state);
 
   const categories: { label: string; value: number }[] = [
     { label: "Situational Awareness", value: score.situationalAwareness },
@@ -25,6 +42,44 @@ export function DebriefView({ state, score, onRestart }: DebriefViewProps) {
     { label: "Response Time", value: score.responseTime },
     { label: "Evacuation Decision", value: score.evacuationDecision },
   ];
+
+  const reportFilename = `criscris-warehouse-fire-${evidenceTimestamp}-report.pdf`;
+  const recordingFilename = `criscris-warehouse-fire-${evidenceTimestamp}-recording.${getRecordingExtension(
+    recording.recordingMimeType,
+  )}`;
+  const recordingUnavailableMessage = recording.recordingError ?? "Recording unavailable";
+
+  const handleDownloadReport = () => {
+    setReportError(null);
+    try {
+      const pdf = createSimulationReportPdf({ state, score, band });
+      downloadBlob(pdf, reportFilename);
+    } catch {
+      setReportError("Report download failed. Please try again.");
+    }
+  };
+
+  const handleDownloadRecording = () => {
+    if (!recording.recordingBlob) return;
+    downloadBlob(recording.recordingBlob, recordingFilename);
+  };
+
+  const handleEmailSupervisor = () => {
+    if (!isValidEmail(supervisorEmail)) {
+      setEmailError("Enter a valid supervisor email.");
+      return;
+    }
+    setEmailError(null);
+    const subject = `Criscris Emergency Simulation Report — Warehouse Fire — Score ${score.total}/100`;
+    const body = createSupervisorEmailBody({ state, score, band });
+    const gmailUrl = new URL("https://mail.google.com/mail/");
+    gmailUrl.searchParams.set("view", "cm");
+    gmailUrl.searchParams.set("fs", "1");
+    gmailUrl.searchParams.set("to", supervisorEmail.trim());
+    gmailUrl.searchParams.set("su", subject);
+    gmailUrl.searchParams.set("body", body);
+    window.open(gmailUrl.toString(), "_blank", "noopener,noreferrer");
+  };
 
   return (
     <main className="grid-backdrop min-h-screen px-4 py-10 sm:px-6">
@@ -53,11 +108,15 @@ export function DebriefView({ state, score, onRestart }: DebriefViewProps) {
           <dl className="grid grid-cols-2 gap-x-8 gap-y-2 text-sm">
             <div>
               <dt className="label-tech">Outcome</dt>
-              <dd>{state.completionReason === "evacuated" ? "Evacuated" : "Timed out inside"}</dd>
+              <dd>{formatOutcome(state)}</dd>
             </div>
             <div>
               <dt className="label-tech">Response time</dt>
-              <dd>{evacuation ? formatTime(evacuation.timestampSeconds) : "No evacuation"}</dd>
+              <dd>{evacuation ? formatDuration(evacuation.timestampSeconds) : "No evacuation"}</dd>
+            </div>
+            <div>
+              <dt className="label-tech">Completed</dt>
+              <dd>{formatCompletionDateTime(state)}</dd>
             </div>
           </dl>
         </div>
@@ -118,7 +177,7 @@ export function DebriefView({ state, score, onRestart }: DebriefViewProps) {
             {state.actions.map((a) => (
               <li key={a.id} className="flex items-center justify-between py-3 text-sm">
                 <span className="font-mono text-muted-foreground">
-                  {formatTime(a.timestampSeconds)}
+                  {formatDuration(a.timestampSeconds)}
                 </span>
                 <span>{ACTION_LABELS[a.type]}</span>
                 <span className="label-tech">{a.stage}</span>
@@ -127,13 +186,65 @@ export function DebriefView({ state, score, onRestart }: DebriefViewProps) {
           </ol>
         </section>
 
-        <button
-          type="button"
-          onClick={onRestart}
-          className="mt-8 w-full rounded bg-primary px-6 py-3.5 font-display text-base font-semibold uppercase tracking-widest text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring sm:w-auto"
-        >
-          Restart Simulation
-        </button>
+        <section className="mt-8 border-t border-border pt-6">
+          <h2 className="label-tech">Simulation evidence</h2>
+          <div className="mt-4 space-y-3">
+            <label className="block max-w-md">
+              <span className="label-tech normal-case tracking-normal">Supervisor email</span>
+              <Input
+                className="mt-2 bg-surface"
+                type="email"
+                inputMode="email"
+                autoComplete="email"
+                placeholder="supervisor@example.com"
+                value={supervisorEmail}
+                onChange={(event) => {
+                  setSupervisorEmail(event.target.value);
+                  if (emailError) setEmailError(null);
+                }}
+              />
+            </label>
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <Button
+                type="button"
+                onClick={handleDownloadReport}
+                className="font-display uppercase tracking-widest"
+              >
+                Download Report
+              </Button>
+              <Button
+                type="button"
+                onClick={handleDownloadRecording}
+                disabled={!recording.recordingAvailable || !recording.recordingBlob}
+                className="font-display uppercase tracking-widest"
+                variant="secondary"
+              >
+                Download Recording
+              </Button>
+              <Button
+                type="button"
+                onClick={handleEmailSupervisor}
+                className="font-display uppercase tracking-widest"
+                variant="outline"
+              >
+                Email Supervisor
+              </Button>
+              <Button
+                type="button"
+                onClick={onRestart}
+                className="font-display uppercase tracking-widest"
+                variant="default"
+              >
+                Restart Simulation
+              </Button>
+            </div>
+          </div>
+          <div className="mt-3 min-h-5 space-y-1 text-sm text-muted-foreground">
+            {!recording.recordingAvailable && <p>{recordingUnavailableMessage}</p>}
+            {reportError && <p className="text-hazard-critical">{reportError}</p>}
+            {emailError && <p className="text-hazard-critical">{emailError}</p>}
+          </div>
+        </section>
 
         <p className="label-tech mt-6 normal-case tracking-normal">
           Prototype training simulation. Scores are heuristic and not a formal safety assessment or
