@@ -16,6 +16,9 @@ const SEED_PATH = "/warehouse-seed.jpg";
 const SEED_UPLOAD_RETRY_MS = 750;
 const SEED_UPLOAD_READY_TIMEOUT_MS = 105_000;
 const REACTOR_ACK_TIMEOUT_MS = 40_000;
+const REACTOR_CONNECT_RETRY_DELAYS_MS = [3_000, 6_000, 10_000] as const;
+const REACTOR_CAPACITY_ERROR_MESSAGE =
+  "Reactor is currently at capacity. Try again shortly or switch to Demo Mode.";
 
 type PendingReactorAck = {
   promise: Promise<void>;
@@ -77,6 +80,17 @@ function isTransientUploadReadinessError(error: unknown): boolean {
   return /status is ["']?(waiting|connecting)["']?/i.test(message);
 }
 
+function isReactorCapacityError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("no available capacity") ||
+    normalized.includes("no available servers") ||
+    (normalized.includes("429") &&
+      (normalized.includes("capacity") || normalized.includes("no available")))
+  );
+}
+
 async function uploadSeedWhenReady(model: LingbotWorld2Model, seed: File): Promise<ReactorFileRef> {
   const deadline = Date.now() + SEED_UPLOAD_READY_TIMEOUT_MS;
 
@@ -105,6 +119,48 @@ function hasDisconnect(
   return (
     "disconnect" in model && typeof (model as { disconnect?: unknown }).disconnect === "function"
   );
+}
+
+async function disconnectQuietly(model: LingbotWorld2Model): Promise<void> {
+  if (!hasDisconnect(model)) return;
+  try {
+    await model.disconnect();
+  } catch {
+    /* ignore */
+  }
+}
+
+async function connectModelWithCapacityRetry(
+  createModel: () => LingbotWorld2Model,
+  jwt: string,
+): Promise<LingbotWorld2Model> {
+  const maxAttempts = REACTOR_CONNECT_RETRY_DELAYS_MS.length + 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const model = createModel();
+    try {
+      await model.connect(jwt);
+      return model;
+    } catch (error) {
+      await disconnectQuietly(model);
+      if (!isReactorCapacityError(error)) {
+        throw error;
+      }
+
+      if (attempt === maxAttempts) {
+        throw new Error(REACTOR_CAPACITY_ERROR_MESSAGE);
+      }
+
+      if (import.meta.env.DEV) {
+        console.info(
+          `[Criscris/Reactor] capacity unavailable; retry ${attempt + 1}/${maxAttempts}`,
+        );
+      }
+      await sleep(REACTOR_CONNECT_RETRY_DELAYS_MS[attempt - 1]);
+    }
+  }
+
+  throw new Error(REACTOR_CAPACITY_ERROR_MESSAGE);
 }
 
 /**
@@ -312,11 +368,9 @@ export class ReactorWorldProvider implements WorldProvider {
 
     if (!model || !this.connected) {
       const jwt = await fetchReactorJwt();
-      model = new LingbotWorld2Model();
+      model = await connectModelWithCapacityRetry(() => new LingbotWorld2Model(), jwt);
       this.model = model;
       this.bindModel(model);
-
-      await model.connect(jwt);
       this.connected = true;
     }
 
