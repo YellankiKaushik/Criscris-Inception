@@ -123,12 +123,14 @@ export interface UseSimulationResult {
   objective: string;
   motion: WorldMotion;
   videoStream: MediaStream | null;
+  worldProgress: string | null;
   recording: SimulationRecordingState;
   providerKind: WorldProviderKind;
   score: ScoreBreakdown | null;
   usedActions: Set<PlayerActionType>;
   start: () => void;
   performAction: (type: PlayerActionType) => void;
+  retryLiveWorld: () => void;
   restart: () => void;
   switchToDemo: () => void;
 }
@@ -137,9 +139,11 @@ export function useSimulation(): UseSimulationResult {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [motion, setMotion] = useState<WorldMotion>(idleMotion);
   const [videoStream, setVideoStream] = useState<MediaStream | null>(null);
+  const [worldProgress, setWorldProgress] = useState<string | null>(null);
   const [recording, setRecording] = useState<SimulationRecordingState>(initialRecordingState);
   const [providerKind, setProviderKind] = useState<WorldProviderKind>(() => resolveProviderKind());
   const providerRef = useRef<WorldProvider | null>(null);
+  const providerDetachRef = useRef<(() => void) | null>(null);
   const startRef = useRef<number | null>(null);
   const stageRef = useRef<ScenarioStage>("briefing");
   const startLockRef = useRef(false);
@@ -161,20 +165,47 @@ export function useSimulation(): UseSimulationResult {
     );
     const offMotion = provider.onMotionChange(setMotion);
     const offVideo = provider.onVideoStream(setVideoStream);
+    let offProgress = () => {};
+    if (provider.onProgressChange) {
+      offProgress = provider.onProgressChange(setWorldProgress);
+    } else {
+      setWorldProgress(null);
+    }
     return () => {
       offStatus();
       offMotion();
       offVideo();
+      offProgress();
     };
   }, []);
 
+  const replaceProvider = useCallback(
+    async (kind: WorldProviderKind): Promise<WorldProvider> => {
+      const previous = providerRef.current;
+      providerDetachRef.current?.();
+      providerDetachRef.current = null;
+      providerRef.current = null;
+      setVideoStream(null);
+      setMotion(idleMotion);
+      setWorldProgress(null);
+      await previous?.dispose();
+
+      const next = createWorldProvider(kind);
+      providerDetachRef.current = attachProvider(next);
+      return next;
+    },
+    [attachProvider],
+  );
+
   useEffect(() => {
     const provider = createWorldProvider();
-    const detach = attachProvider(provider);
+    providerDetachRef.current = attachProvider(provider);
     return () => {
-      detach();
-      void providerRef.current?.dispose();
+      const current = providerRef.current;
+      providerDetachRef.current?.();
+      providerDetachRef.current = null;
       providerRef.current = null;
+      void current?.dispose();
     };
   }, [attachProvider]);
 
@@ -204,31 +235,38 @@ export function useSimulation(): UseSimulationResult {
     setRecording(initialRecordingState);
   }, [stopRecorder]);
 
+  const runStart = useCallback(
+    (provider: WorldProvider) => {
+      clearRecording();
+      startLockRef.current = true;
+      const generation = ++generationRef.current;
+      dispatch({ type: "start" });
+      void (async () => {
+        try {
+          await provider.initialize({ initialPrompt: LOW_PROMPT });
+          if (generation !== generationRef.current) return;
+          await provider.start();
+          if (generation !== generationRef.current) return;
+          startRef.current = Date.now();
+          dispatch({ type: "started" });
+        } catch (error) {
+          if (generation !== generationRef.current) return;
+          const message =
+            error instanceof Error ? error.message : "Unable to start the simulation world.";
+          dispatch({ type: "fail", error: message });
+        } finally {
+          if (generation === generationRef.current) startLockRef.current = false;
+        }
+      })();
+    },
+    [clearRecording],
+  );
+
   const start = useCallback(() => {
     const provider = providerRef.current;
     if (!provider || startLockRef.current) return;
-    clearRecording();
-    startLockRef.current = true;
-    const generation = ++generationRef.current;
-    dispatch({ type: "start" });
-    void (async () => {
-      try {
-        await provider.initialize({ initialPrompt: LOW_PROMPT });
-        if (generation !== generationRef.current) return;
-        await provider.start();
-        if (generation !== generationRef.current) return;
-        startRef.current = Date.now();
-        dispatch({ type: "started" });
-      } catch (error) {
-        if (generation !== generationRef.current) return;
-        const message =
-          error instanceof Error ? error.message : "Unable to start the simulation world.";
-        dispatch({ type: "fail", error: message });
-      } finally {
-        if (generation === generationRef.current) startLockRef.current = false;
-      }
-    })();
-  }, [clearRecording]);
+    runStart(provider);
+  }, [runStart]);
 
   useEffect(() => {
     if (state.status !== "running" || !videoStream || recorderRef.current) return;
@@ -319,6 +357,47 @@ export function useSimulation(): UseSimulationResult {
       stopRecorder();
     };
   }, [stopRecorder]);
+
+  useEffect(() => {
+    if (state.status !== "complete" || providerKind !== "mock") return;
+    setRecording((current) =>
+      current.recordingAvailable || current.recordingError
+        ? current
+        : {
+            ...current,
+            recordingError: "Recording is available for Live Reactor sessions.",
+          },
+    );
+  }, [state.status, providerKind]);
+
+  useEffect(() => {
+    if (state.status !== "running" || providerKind !== "reactor" || !videoStream) return;
+    const generation = generationRef.current;
+    const tracks = videoStream.getVideoTracks();
+
+    const onEnded = () => {
+      if (generation !== generationRef.current) return;
+      void providerRef.current?.pause();
+      dispatch({
+        type: "fail",
+        error: "The live world video stream ended. Retry Live World or switch to Demo Mode.",
+      });
+    };
+
+    if (tracks.some((track) => track.readyState === "ended")) {
+      onEnded();
+      return;
+    }
+
+    for (const track of tracks) {
+      track.addEventListener("ended", onEnded);
+    }
+    return () => {
+      for (const track of tracks) {
+        track.removeEventListener("ended", onEnded);
+      }
+    };
+  }, [state.status, providerKind, videoStream]);
 
   useEffect(() => {
     if (state.status !== "running") return;
@@ -446,18 +525,53 @@ export function useSimulation(): UseSimulationResult {
     dispatch({ type: "reset" });
   }, [clearRecording]);
 
-  const switchToDemo = useCallback(() => {
-    generationRef.current += 1;
-    startLockRef.current = false;
+  const retryLiveWorld = useCallback(() => {
+    if (startLockRef.current) return;
+    const generation = ++generationRef.current;
+    startLockRef.current = true;
     startRef.current = null;
     stageRef.current = "briefing";
     clearRecording();
-    const previous = providerRef.current;
-    void previous?.dispose();
-    const next = createWorldProvider("mock");
-    attachProvider(next);
-    dispatch({ type: "reset" });
-  }, [attachProvider, clearRecording]);
+    void (async () => {
+      try {
+        const next = await replaceProvider("reactor");
+        if (generation !== generationRef.current) return;
+        startLockRef.current = false;
+        runStart(next);
+      } catch {
+        if (generation !== generationRef.current) return;
+        startLockRef.current = false;
+        dispatch({
+          type: "fail",
+          error: "Unable to retry the live world. Switch to Demo Mode to continue.",
+        });
+      }
+    })();
+  }, [clearRecording, replaceProvider, runStart]);
+
+  const switchToDemo = useCallback(() => {
+    if (startLockRef.current) return;
+    const generation = ++generationRef.current;
+    startLockRef.current = true;
+    startRef.current = null;
+    stageRef.current = "briefing";
+    clearRecording();
+    void (async () => {
+      try {
+        const next = await replaceProvider("mock");
+        if (generation !== generationRef.current) return;
+        startLockRef.current = false;
+        runStart(next);
+      } catch {
+        if (generation !== generationRef.current) return;
+        startLockRef.current = false;
+        dispatch({
+          type: "fail",
+          error: "Unable to start Demo Mode. Please restart the simulation.",
+        });
+      }
+    })();
+  }, [clearRecording, replaceProvider, runStart]);
 
   const objective =
     state.stage === "briefing"
@@ -478,12 +592,14 @@ export function useSimulation(): UseSimulationResult {
     objective,
     motion,
     videoStream,
+    worldProgress,
     recording,
     providerKind,
     score,
     usedActions,
     start,
     performAction,
+    retryLiveWorld,
     restart,
     switchToDemo,
   };
