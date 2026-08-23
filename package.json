@@ -1,6 +1,8 @@
 {
-  "name": "tanstack_start_ts",
+  "name": "criscris",
   "private": true,
+  "author": "Kaushik Yellanki",
+  "description": "Interactive emergency-response simulation powered by real-time world models.",
   "sideEffects": false,
   "type": "module",
   "scripts": {
