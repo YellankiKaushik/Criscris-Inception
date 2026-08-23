@@ -15,6 +15,14 @@ type ReactorFileRef = Awaited<ReturnType<LingbotWorld2Model["uploadFile"]>>;
 const SEED_PATH = "/warehouse-seed.jpg";
 const SEED_UPLOAD_RETRY_MS = 750;
 const SEED_UPLOAD_READY_TIMEOUT_MS = 105_000;
+const REACTOR_ACK_TIMEOUT_MS = 40_000;
+
+type PendingReactorAck = {
+  promise: Promise<void>;
+  timeoutId: ReturnType<typeof setTimeout>;
+  resolve: () => void;
+  reject: (error: Error) => void;
+};
 
 const idleMotion = (): WorldMotion => ({
   longitudinal: "idle",
@@ -115,6 +123,10 @@ export class ReactorWorldProvider implements WorldProvider {
   private connected = false;
   private initPromise: Promise<void> | null = null;
   private disposed = false;
+  private conditionsReady = false;
+  private generationStarted = false;
+  private pendingConditionsReady: PendingReactorAck | null = null;
+  private pendingGenerationStarted: PendingReactorAck | null = null;
 
   private statusListeners = new Set<(status: WorldStatus, error: string | null) => void>();
   private motionListeners = new Set<(motion: WorldMotion) => void>();
@@ -136,6 +148,81 @@ export class ReactorWorldProvider implements WorldProvider {
     for (const l of this.videoListeners) l(stream);
   }
 
+  private waitForConditionsReady(): Promise<void> {
+    if (this.conditionsReady) return Promise.resolve();
+    if (this.pendingConditionsReady) return this.pendingConditionsReady.promise;
+
+    const pending = {} as PendingReactorAck;
+    pending.promise = new Promise<void>((resolve, reject) => {
+      pending.timeoutId = setTimeout(() => {
+        if (this.pendingConditionsReady === pending) {
+          this.pendingConditionsReady = null;
+        }
+        reject(new Error("Timed out waiting for the Reactor session conditions to become ready."));
+      }, REACTOR_ACK_TIMEOUT_MS);
+      pending.resolve = () => resolve();
+      pending.reject = reject;
+    });
+    this.pendingConditionsReady = pending;
+    return pending.promise;
+  }
+
+  private resolvePendingConditionsReady() {
+    const pending = this.pendingConditionsReady;
+    if (!pending) return;
+    clearTimeout(pending.timeoutId);
+    this.pendingConditionsReady = null;
+    pending.resolve();
+  }
+
+  private rejectPendingConditionsReady(error: Error) {
+    const pending = this.pendingConditionsReady;
+    if (!pending) return;
+    clearTimeout(pending.timeoutId);
+    this.pendingConditionsReady = null;
+    pending.reject(error);
+  }
+
+  private waitForGenerationStarted(): Promise<void> {
+    if (this.generationStarted) return Promise.resolve();
+    if (this.pendingGenerationStarted) return this.pendingGenerationStarted.promise;
+
+    const pending = {} as PendingReactorAck;
+    pending.promise = new Promise<void>((resolve, reject) => {
+      pending.timeoutId = setTimeout(() => {
+        if (this.pendingGenerationStarted === pending) {
+          this.pendingGenerationStarted = null;
+        }
+        reject(new Error("Timed out waiting for the Reactor world to start generating video."));
+      }, REACTOR_ACK_TIMEOUT_MS);
+      pending.resolve = () => resolve();
+      pending.reject = reject;
+    });
+    this.pendingGenerationStarted = pending;
+    return pending.promise;
+  }
+
+  private resolvePendingGenerationStarted() {
+    const pending = this.pendingGenerationStarted;
+    if (!pending) return;
+    clearTimeout(pending.timeoutId);
+    this.pendingGenerationStarted = null;
+    pending.resolve();
+  }
+
+  private rejectPendingGenerationStarted(error: Error) {
+    const pending = this.pendingGenerationStarted;
+    if (!pending) return;
+    clearTimeout(pending.timeoutId);
+    this.pendingGenerationStarted = null;
+    pending.reject(error);
+  }
+
+  private clearPendingAcks(error: Error) {
+    this.rejectPendingConditionsReady(error);
+    this.rejectPendingGenerationStarted(error);
+  }
+
   private bindModel(model: LingbotWorld2Model) {
     this.unsubscribers.push(
       model.onMainVideo((_track, stream) => {
@@ -154,11 +241,20 @@ export class ReactorWorldProvider implements WorldProvider {
         ) {
           return;
         }
-        this.setStatus("error", safeCommandMessage(command, reason));
+        const safeMessage = safeCommandMessage(command, reason);
+        if (command === "set_image" || command === "set_prompt") {
+          this.rejectPendingConditionsReady(new Error(safeMessage));
+        }
+        if (command === "start") {
+          this.rejectPendingGenerationStarted(new Error(safeMessage));
+        }
+        this.setStatus("error", safeMessage);
       }),
     );
     this.unsubscribers.push(
       model.onGenerationStarted(() => {
+        this.generationStarted = true;
+        this.resolvePendingGenerationStarted();
         this.setStatus("generating");
       }),
     );
@@ -174,7 +270,14 @@ export class ReactorWorldProvider implements WorldProvider {
     );
     this.unsubscribers.push(model.onImageAccepted(() => undefined));
     this.unsubscribers.push(model.onPromptAccepted(() => undefined));
-    this.unsubscribers.push(model.onConditionsReady(() => undefined));
+    this.unsubscribers.push(
+      model.onConditionsReady((msg) => {
+        this.conditionsReady = msg.has_image && msg.has_prompt;
+        if (this.conditionsReady) {
+          this.resolvePendingConditionsReady();
+        }
+      }),
+    );
     this.unsubscribers.push(model.onChunkComplete(() => undefined));
   }
 
@@ -219,8 +322,11 @@ export class ReactorWorldProvider implements WorldProvider {
 
     const seed = await loadSeedFile(input.seedImage);
     const fileRef = await uploadSeedWhenReady(model, seed);
+    this.conditionsReady = false;
+    this.generationStarted = false;
     await model.setImage({ image: fileRef });
     await model.setPrompt({ prompt: input.initialPrompt });
+    await this.waitForConditionsReady();
     this.lastPrompt = input.initialPrompt;
     this.setStatus("ready");
   }
@@ -229,8 +335,14 @@ export class ReactorWorldProvider implements WorldProvider {
     if (!this.model) {
       throw new Error("World model is not initialized.");
     }
-    await this.model.start();
-    this.setStatus("generating");
+    this.generationStarted = false;
+    const generationStarted = this.waitForGenerationStarted();
+    try {
+      await this.model.start();
+    } catch {
+      this.rejectPendingGenerationStarted(new Error(safeCommandMessage("start", "")));
+    }
+    await generationStarted;
   }
 
   async setScenarioPrompt(prompt: string): Promise<void> {
@@ -276,16 +388,22 @@ export class ReactorWorldProvider implements WorldProvider {
   }
 
   async reset(): Promise<void> {
+    this.clearPendingAcks(new Error("The Reactor session was reset before it became ready."));
+    this.conditionsReady = false;
+    this.generationStarted = false;
     await this.idleAll();
     this.emitVideo(null);
     this.lastPrompt = "";
     await this.model?.reset();
     this.initPromise = null;
-    this.setStatus("ready");
+    this.setStatus("idle");
   }
 
   async dispose(): Promise<void> {
     this.disposed = true;
+    this.clearPendingAcks(new Error("The Reactor session was closed before it became ready."));
+    this.conditionsReady = false;
+    this.generationStarted = false;
     await this.idleAll();
     this.emitVideo(null);
     for (const off of this.unsubscribers) {
