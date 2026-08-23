@@ -98,12 +98,32 @@ const idleMotion: WorldMotion = {
   lookVertical: "idle",
 };
 
+export interface SimulationRecordingState {
+  recordingBlob: Blob | null;
+  recordingMimeType: string | null;
+  recordingAvailable: boolean;
+  recordingError: string | null;
+}
+
+const initialRecordingState: SimulationRecordingState = {
+  recordingBlob: null,
+  recordingMimeType: null,
+  recordingAvailable: false,
+  recordingError: null,
+};
+
+function getSupportedRecordingMimeType(): string {
+  const candidates = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
+  return candidates.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
+}
+
 export interface UseSimulationResult {
   state: SimulationState;
   config: ScenarioConfig;
   objective: string;
   motion: WorldMotion;
   videoStream: MediaStream | null;
+  recording: SimulationRecordingState;
   providerKind: WorldProviderKind;
   score: ScoreBreakdown | null;
   usedActions: Set<PlayerActionType>;
@@ -117,12 +137,16 @@ export function useSimulation(): UseSimulationResult {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [motion, setMotion] = useState<WorldMotion>(idleMotion);
   const [videoStream, setVideoStream] = useState<MediaStream | null>(null);
+  const [recording, setRecording] = useState<SimulationRecordingState>(initialRecordingState);
   const [providerKind, setProviderKind] = useState<WorldProviderKind>(() => resolveProviderKind());
   const providerRef = useRef<WorldProvider | null>(null);
   const startRef = useRef<number | null>(null);
   const stageRef = useRef<ScenarioStage>("briefing");
   const startLockRef = useRef(false);
   const generationRef = useRef(0);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recordingChunksRef = useRef<Blob[]>([]);
+  const recordingGenerationRef = useRef(0);
 
   const config = useMemo(
     () => resolveScenarioConfig(typeof window === "undefined" ? "" : window.location.search),
@@ -156,9 +180,34 @@ export function useSimulation(): UseSimulationResult {
 
   stageRef.current = state.stage;
 
+  const stopRecorder = useCallback(() => {
+    const recorder = recorderRef.current;
+    if (!recorder) return;
+    recorderRef.current = null;
+    try {
+      if (recorder.state !== "inactive") {
+        recorder.stop();
+      }
+    } catch {
+      setRecording((current) => ({
+        ...current,
+        recordingError: "Recording unavailable",
+      }));
+    }
+  }, []);
+
+  const clearRecording = useCallback(() => {
+    recordingGenerationRef.current += 1;
+    stopRecorder();
+    recordingChunksRef.current = [];
+    recorderRef.current = null;
+    setRecording(initialRecordingState);
+  }, [stopRecorder]);
+
   const start = useCallback(() => {
     const provider = providerRef.current;
     if (!provider || startLockRef.current) return;
+    clearRecording();
     startLockRef.current = true;
     const generation = ++generationRef.current;
     dispatch({ type: "start" });
@@ -179,7 +228,97 @@ export function useSimulation(): UseSimulationResult {
         if (generation === generationRef.current) startLockRef.current = false;
       }
     })();
-  }, []);
+  }, [clearRecording]);
+
+  useEffect(() => {
+    if (state.status !== "running" || !videoStream || recorderRef.current) return;
+    if (typeof MediaRecorder === "undefined") {
+      setRecording({
+        recordingBlob: null,
+        recordingMimeType: null,
+        recordingAvailable: false,
+        recordingError: "Recording unavailable: MediaRecorder is not supported in this browser.",
+      });
+      return;
+    }
+
+    const mimeType = getSupportedRecordingMimeType();
+    const options = mimeType ? { mimeType } : undefined;
+    const recordingGeneration = recordingGenerationRef.current;
+    recordingChunksRef.current = [];
+
+    try {
+      const recorder = new MediaRecorder(videoStream, options);
+      recorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          recordingChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onerror = () => {
+        if (recordingGeneration !== recordingGenerationRef.current) return;
+        setRecording((current) => ({
+          ...current,
+          recordingAvailable: false,
+          recordingError: "Recording unavailable",
+        }));
+      };
+
+      recorder.onstop = () => {
+        if (recordingGeneration !== recordingGenerationRef.current) return;
+        const chunks = recordingChunksRef.current;
+        const finalMimeType = recorder.mimeType || mimeType || "video/webm";
+        recordingChunksRef.current = [];
+        if (chunks.length === 0) {
+          setRecording({
+            recordingBlob: null,
+            recordingMimeType: finalMimeType,
+            recordingAvailable: false,
+            recordingError: "Recording unavailable",
+          });
+          return;
+        }
+        setRecording({
+          recordingBlob: new Blob(chunks, { type: finalMimeType }),
+          recordingMimeType: finalMimeType,
+          recordingAvailable: true,
+          recordingError: null,
+        });
+      };
+
+      recorder.start(1000);
+      setRecording({
+        recordingBlob: null,
+        recordingMimeType: recorder.mimeType || mimeType || "video/webm",
+        recordingAvailable: false,
+        recordingError: null,
+      });
+    } catch {
+      recorderRef.current = null;
+      recordingChunksRef.current = [];
+      setRecording({
+        recordingBlob: null,
+        recordingMimeType: mimeType || null,
+        recordingAvailable: false,
+        recordingError: "Recording unavailable",
+      });
+    }
+  }, [state.status, videoStream]);
+
+  useEffect(() => {
+    if (state.status === "complete" || state.status === "error") {
+      stopRecorder();
+    }
+  }, [state.status, stopRecorder]);
+
+  useEffect(() => {
+    return () => {
+      recordingGenerationRef.current += 1;
+      stopRecorder();
+    };
+  }, [stopRecorder]);
 
   useEffect(() => {
     if (state.status !== "running") return;
@@ -302,21 +441,23 @@ export function useSimulation(): UseSimulationResult {
     startLockRef.current = false;
     startRef.current = null;
     stageRef.current = "briefing";
+    clearRecording();
     void providerRef.current?.reset();
     dispatch({ type: "reset" });
-  }, []);
+  }, [clearRecording]);
 
   const switchToDemo = useCallback(() => {
     generationRef.current += 1;
     startLockRef.current = false;
     startRef.current = null;
     stageRef.current = "briefing";
+    clearRecording();
     const previous = providerRef.current;
     void previous?.dispose();
     const next = createWorldProvider("mock");
     attachProvider(next);
     dispatch({ type: "reset" });
-  }, [attachProvider]);
+  }, [attachProvider, clearRecording]);
 
   const objective =
     state.stage === "briefing"
@@ -337,6 +478,7 @@ export function useSimulation(): UseSimulationResult {
     objective,
     motion,
     videoStream,
+    recording,
     providerKind,
     score,
     usedActions,
