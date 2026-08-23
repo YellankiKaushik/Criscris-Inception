@@ -37,4 +37,6 @@ export interface WorldProvider {
   onMotionChange(listener: (motion: WorldMotion) => void): () => void;
   /** Reactor main_video stream. Mock providers emit null. */
   onVideoStream(listener: (stream: MediaStream | null) => void): () => void;
+  /** Startup progress for long-running live world preparation. */
+  onProgressChange?(listener: (message: string | null) => void): () => void;
 }
