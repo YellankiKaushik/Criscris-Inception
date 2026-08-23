@@ -16,9 +16,12 @@ const SEED_PATH = "/warehouse-seed.jpg";
 const SEED_UPLOAD_RETRY_MS = 750;
 const SEED_UPLOAD_READY_TIMEOUT_MS = 105_000;
 const REACTOR_ACK_TIMEOUT_MS = 40_000;
+const REACTOR_MAIN_VIDEO_TIMEOUT_MS = 30_000;
 const REACTOR_CONNECT_RETRY_DELAYS_MS = [3_000, 6_000, 10_000] as const;
 const REACTOR_CAPACITY_ERROR_MESSAGE =
   "Reactor is currently at capacity. Try again shortly or switch to Demo Mode.";
+const REACTOR_MAIN_VIDEO_ERROR_MESSAGE =
+  "Reactor started the world but no video stream became available. Try again or switch to Demo Mode.";
 
 type PendingReactorAck = {
   promise: Promise<void>;
@@ -88,6 +91,14 @@ function isReactorCapacityError(error: unknown): boolean {
     normalized.includes("no available servers") ||
     (normalized.includes("429") &&
       (normalized.includes("capacity") || normalized.includes("no available")))
+  );
+}
+
+function isUsableMainVideoStream(track: MediaStreamTrack, stream: MediaStream): boolean {
+  return (
+    track.kind === "video" &&
+    track.readyState !== "ended" &&
+    stream.getVideoTracks().some((videoTrack) => videoTrack.id === track.id)
   );
 }
 
@@ -181,8 +192,10 @@ export class ReactorWorldProvider implements WorldProvider {
   private disposed = false;
   private conditionsReady = false;
   private generationStarted = false;
+  private mainVideoReady = false;
   private pendingConditionsReady: PendingReactorAck | null = null;
   private pendingGenerationStarted: PendingReactorAck | null = null;
+  private pendingMainVideoReady: PendingReactorAck | null = null;
 
   private statusListeners = new Set<(status: WorldStatus, error: string | null) => void>();
   private motionListeners = new Set<(motion: WorldMotion) => void>();
@@ -274,15 +287,55 @@ export class ReactorWorldProvider implements WorldProvider {
     pending.reject(error);
   }
 
+  private waitForMainVideoReady(): Promise<void> {
+    if (this.mainVideoReady) return Promise.resolve();
+    if (this.pendingMainVideoReady) return this.pendingMainVideoReady.promise;
+
+    const pending = {} as PendingReactorAck;
+    pending.promise = new Promise<void>((resolve, reject) => {
+      pending.timeoutId = setTimeout(() => {
+        if (this.pendingMainVideoReady === pending) {
+          this.pendingMainVideoReady = null;
+        }
+        reject(new Error(REACTOR_MAIN_VIDEO_ERROR_MESSAGE));
+      }, REACTOR_MAIN_VIDEO_TIMEOUT_MS);
+      pending.resolve = () => resolve();
+      pending.reject = reject;
+    });
+    this.pendingMainVideoReady = pending;
+    return pending.promise;
+  }
+
+  private resolvePendingMainVideoReady() {
+    const pending = this.pendingMainVideoReady;
+    if (!pending) return;
+    clearTimeout(pending.timeoutId);
+    this.pendingMainVideoReady = null;
+    pending.resolve();
+  }
+
+  private rejectPendingMainVideoReady(error: Error) {
+    const pending = this.pendingMainVideoReady;
+    if (!pending) return;
+    clearTimeout(pending.timeoutId);
+    this.pendingMainVideoReady = null;
+    pending.reject(error);
+  }
+
   private clearPendingAcks(error: Error) {
     this.rejectPendingConditionsReady(error);
     this.rejectPendingGenerationStarted(error);
+    this.rejectPendingMainVideoReady(error);
   }
 
   private bindModel(model: LingbotWorld2Model) {
     this.unsubscribers.push(
-      model.onMainVideo((_track, stream) => {
+      model.onMainVideo((track, stream) => {
         this.emitVideo(stream);
+        if (isUsableMainVideoStream(track, stream)) {
+          this.mainVideoReady = true;
+          this.resolvePendingMainVideoReady();
+        }
       }),
     );
     this.unsubscribers.push(
@@ -303,6 +356,7 @@ export class ReactorWorldProvider implements WorldProvider {
         }
         if (command === "start") {
           this.rejectPendingGenerationStarted(new Error(safeMessage));
+          this.rejectPendingMainVideoReady(new Error(safeMessage));
         }
         this.setStatus("error", safeMessage);
       }),
@@ -365,6 +419,8 @@ export class ReactorWorldProvider implements WorldProvider {
   private async connectAndArm(input: { initialPrompt: string; seedImage?: Blob }): Promise<void> {
     const { LingbotWorld2Model } = await import("@reactor-models/lingbot-world-2");
     let model = this.model;
+    this.mainVideoReady = false;
+    this.emitVideo(null);
 
     if (!model || !this.connected) {
       const jwt = await fetchReactorJwt();
@@ -391,12 +447,15 @@ export class ReactorWorldProvider implements WorldProvider {
     }
     this.generationStarted = false;
     const generationStarted = this.waitForGenerationStarted();
+    const mainVideoReady = this.waitForMainVideoReady();
     try {
       await this.model.start();
     } catch {
-      this.rejectPendingGenerationStarted(new Error(safeCommandMessage("start", "")));
+      const error = new Error(safeCommandMessage("start", ""));
+      this.rejectPendingGenerationStarted(error);
+      this.rejectPendingMainVideoReady(error);
     }
-    await generationStarted;
+    await Promise.all([generationStarted, mainVideoReady]);
   }
 
   async setScenarioPrompt(prompt: string): Promise<void> {
@@ -445,6 +504,7 @@ export class ReactorWorldProvider implements WorldProvider {
     this.clearPendingAcks(new Error("The Reactor session was reset before it became ready."));
     this.conditionsReady = false;
     this.generationStarted = false;
+    this.mainVideoReady = false;
     await this.idleAll();
     this.emitVideo(null);
     this.lastPrompt = "";
@@ -458,6 +518,7 @@ export class ReactorWorldProvider implements WorldProvider {
     this.clearPendingAcks(new Error("The Reactor session was closed before it became ready."));
     this.conditionsReady = false;
     this.generationStarted = false;
+    this.mainVideoReady = false;
     await this.idleAll();
     this.emitVideo(null);
     for (const off of this.unsubscribers) {
