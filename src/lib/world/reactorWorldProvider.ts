@@ -10,8 +10,11 @@ import type {
 } from "./types";
 
 type LingbotWorld2Model = import("@reactor-models/lingbot-world-2").LingbotWorld2Model;
+type ReactorFileRef = Awaited<ReturnType<LingbotWorld2Model["uploadFile"]>>;
 
 const SEED_PATH = "/warehouse-seed.jpg";
+const SEED_UPLOAD_RETRY_MS = 750;
+const SEED_UPLOAD_READY_TIMEOUT_MS = 105_000;
 
 const idleMotion = (): WorldMotion => ({
   longitudinal: "idle",
@@ -55,6 +58,37 @@ async function loadSeedFile(provided?: Blob): Promise<File> {
   }
   const blob = await response.blob();
   return new File([blob], "warehouse-seed.jpg", { type: blob.type || "image/jpeg" });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTransientUploadReadinessError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /status is ["']?(waiting|connecting)["']?/i.test(message);
+}
+
+async function uploadSeedWhenReady(model: LingbotWorld2Model, seed: File): Promise<ReactorFileRef> {
+  const deadline = Date.now() + SEED_UPLOAD_READY_TIMEOUT_MS;
+
+  while (true) {
+    try {
+      return await model.uploadFile(seed);
+    } catch (error) {
+      if (!isTransientUploadReadinessError(error)) {
+        throw error;
+      }
+
+      if (Date.now() + SEED_UPLOAD_RETRY_MS > deadline) {
+        throw new Error(
+          "Timed out waiting for the Reactor session to become ready before uploading the warehouse seed.",
+        );
+      }
+
+      await sleep(SEED_UPLOAD_RETRY_MS);
+    }
+  }
 }
 
 function hasDisconnect(
@@ -184,7 +218,7 @@ export class ReactorWorldProvider implements WorldProvider {
     }
 
     const seed = await loadSeedFile(input.seedImage);
-    const fileRef = await model.uploadFile(seed);
+    const fileRef = await uploadSeedWhenReady(model, seed);
     await model.setImage({ image: fileRef });
     await model.setPrompt({ prompt: input.initialPrompt });
     this.lastPrompt = input.initialPrompt;
