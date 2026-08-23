@@ -10,12 +10,12 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Criscris - Warehouse Fire Emergency Response Simulation" },
+      { title: "Criscris — Emergency Response Simulation" },
       {
         name: "description",
-        content:
-          "Interactive emergency-response training simulation powered by a real-time world model.",
+        content: "Interactive emergency-response simulation powered by real-time world models.",
       },
+      { name: "author", content: "Kaushik Yellanki" },
     ],
     links: [
       { rel: "stylesheet", href: appCss },
