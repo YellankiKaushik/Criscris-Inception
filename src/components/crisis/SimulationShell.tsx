@@ -14,9 +14,11 @@ export function SimulationShell({
   objective,
   motion,
   videoStream,
+  worldProgress,
   providerKind,
   usedActions,
   performAction,
+  retryLiveWorld,
   switchToDemo,
 }: UseSimulationResult) {
   const hazardClass =
@@ -26,7 +28,18 @@ export function SimulationShell({
         ? "border-hazard-high/60 text-hazard-high"
         : "border-hazard-low/60 text-hazard-low";
 
-  const connected = state.worldStatus === "ready" || state.worldStatus === "generating";
+  const connected =
+    providerKind === "reactor"
+      ? state.worldStatus === "generating" && Boolean(videoStream)
+      : state.worldStatus === "ready" || state.worldStatus === "generating";
+  const worldLabel =
+    providerKind === "mock"
+      ? state.worldStatus === "generating"
+        ? "Demo Active"
+        : "Demo"
+      : connected
+        ? "Live"
+        : state.worldStatus;
 
   return (
     <main className="flex min-h-screen flex-col">
@@ -57,7 +70,7 @@ export function SimulationShell({
                     : "bg-muted-foreground",
               )}
             />
-            World: {connected ? "Connected" : state.worldStatus}
+            World: {worldLabel}
           </span>
         </div>
       </header>
@@ -71,7 +84,9 @@ export function SimulationShell({
             providerKind={providerKind}
             isRunning={state.status === "running"}
             videoStream={videoStream}
+            startupMessage={worldProgress}
             worldError={state.worldError}
+            onRetryLiveWorld={retryLiveWorld}
             onSwitchToDemo={switchToDemo}
           />
         </div>

@@ -27,7 +27,10 @@ export const Route = createFileRoute("/")({
 
 function Index() {
   const simulation = useSimulation();
-  const { state, score, recording, start, restart, switchToDemo, providerKind } = simulation;
+  const { state, score, recording, start, retryLiveWorld, restart, switchToDemo, providerKind } =
+    simulation;
+  const primaryStart =
+    state.status === "error" && providerKind === "reactor" ? retryLiveWorld : start;
 
   if (state.status === "complete" && score) {
     return <DebriefView state={state} score={score} recording={recording} onRestart={restart} />;
@@ -39,10 +42,11 @@ function Index() {
 
   return (
     <ScenarioBriefing
-      onStart={start}
+      onStart={primaryStart}
       starting={state.status === "starting"}
       error={state.status === "error" ? state.worldError : null}
       providerKind={providerKind}
+      onRetryLiveWorld={retryLiveWorld}
       onSwitchToDemo={switchToDemo}
     />
   );

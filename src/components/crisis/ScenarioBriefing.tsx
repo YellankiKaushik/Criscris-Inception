@@ -6,6 +6,7 @@ interface ScenarioBriefingProps {
   starting: boolean;
   error?: string | null;
   providerKind?: "mock" | "reactor";
+  onRetryLiveWorld?: () => void;
   onSwitchToDemo?: () => void;
 }
 
@@ -20,6 +21,7 @@ export function ScenarioBriefing({
   starting,
   error,
   providerKind = "mock",
+  onRetryLiveWorld,
   onSwitchToDemo,
 }: ScenarioBriefingProps) {
   const [showScoring, setShowScoring] = useState(false);
@@ -72,14 +74,27 @@ export function ScenarioBriefing({
             <div className="mt-4 rounded border border-hazard-critical/50 bg-hazard-critical/10 p-3 text-sm">
               <p className="font-medium text-hazard-critical">World failed to start</p>
               <p className="mt-1 text-muted-foreground">{error}</p>
-              {providerKind === "reactor" && onSwitchToDemo && (
-                <button
-                  type="button"
-                  onClick={onSwitchToDemo}
-                  className="mt-3 rounded border border-border px-3 py-1.5 font-display text-xs uppercase tracking-widest"
-                >
-                  Switch to Demo Mode
-                </button>
+              {providerKind === "reactor" && (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {onRetryLiveWorld && (
+                    <button
+                      type="button"
+                      onClick={onRetryLiveWorld}
+                      className="rounded bg-primary px-3 py-1.5 font-display text-xs uppercase tracking-widest text-primary-foreground"
+                    >
+                      Retry Live World
+                    </button>
+                  )}
+                  {onSwitchToDemo && (
+                    <button
+                      type="button"
+                      onClick={onSwitchToDemo}
+                      className="rounded border border-border px-3 py-1.5 font-display text-xs uppercase tracking-widest"
+                    >
+                      Switch to Demo Mode
+                    </button>
+                  )}
+                </div>
               )}
             </div>
           )}
