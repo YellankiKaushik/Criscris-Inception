@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { HazardLevel, WorldStatus } from "@/lib/scenario/types";
 import type { WorldMotion } from "@/lib/world/types";
 import { cn } from "@/lib/utils";
@@ -10,7 +10,9 @@ interface WorldViewportProps {
   providerKind: "mock" | "reactor";
   isRunning: boolean;
   videoStream: MediaStream | null;
+  startupMessage?: string | null;
   worldError: string | null;
+  onRetryLiveWorld?: () => void;
   onSwitchToDemo?: () => void;
 }
 
@@ -20,6 +22,24 @@ const smokeOpacity: Record<HazardLevel, string> = {
   CRITICAL: "opacity-85",
 };
 
+interface DemoCamera {
+  x: number;
+  y: number;
+  zoom: number;
+  yaw: number;
+}
+
+const initialDemoCamera: DemoCamera = {
+  x: 0,
+  y: 0,
+  zoom: 1.08,
+  yaw: 0,
+};
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
 export function WorldViewport({
   hazardLevel,
   worldStatus,
@@ -27,42 +47,112 @@ export function WorldViewport({
   providerKind,
   isRunning,
   videoStream,
+  startupMessage,
   worldError,
+  onRetryLiveWorld,
   onSwitchToDemo,
 }: WorldViewportProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const motionRef = useRef(motion);
+  const cameraRef = useRef<DemoCamera>(initialDemoCamera);
+  const [demoCamera, setDemoCamera] = useState<DemoCamera>(initialDemoCamera);
   const reactorLive = providerKind === "reactor";
+
+  useEffect(() => {
+    motionRef.current = motion;
+  }, [motion]);
+
+  useEffect(() => {
+    if (providerKind !== "mock") return;
+    cameraRef.current = initialDemoCamera;
+    setDemoCamera(initialDemoCamera);
+  }, [providerKind]);
 
   useEffect(() => {
     const el = videoRef.current;
     if (!el) return;
+    let playAttempted = false;
+
+    const attemptPlay = () => {
+      if (!videoStream || playAttempted) return;
+      playAttempted = true;
+      void el.play().catch(() => {
+        playAttempted = false;
+      });
+    };
+
     el.srcObject = videoStream;
     if (videoStream) {
-      void el.play().catch(() => undefined);
+      attemptPlay();
+      el.addEventListener("loadedmetadata", attemptPlay);
+      el.addEventListener("canplay", attemptPlay);
     }
     return () => {
-      el.srcObject = null;
+      el.removeEventListener("loadedmetadata", attemptPlay);
+      el.removeEventListener("canplay", attemptPlay);
+      if (el.srcObject === videoStream) {
+        el.srcObject = null;
+      }
     };
   }, [videoStream]);
-
-  const transform = useMemo(() => {
-    const parts: string[] = [];
-    if (motion.longitudinal === "forward") parts.push("scale(1.1)");
-    if (motion.longitudinal === "back") parts.push("scale(1.01)");
-    if (motion.lateral === "strafe_left") parts.push("translateX(2.5%)");
-    if (motion.lateral === "strafe_right") parts.push("translateX(-2.5%)");
-    if (motion.lookHorizontal === "left") parts.push("translateX(4%) rotate(-0.6deg)");
-    if (motion.lookHorizontal === "right") parts.push("translateX(-4%) rotate(0.6deg)");
-    if (motion.lookVertical === "up") parts.push("translateY(3%)");
-    if (motion.lookVertical === "down") parts.push("translateY(-3%)");
-    return parts.length ? parts.join(" ") : undefined;
-  }, [motion]);
 
   const moving =
     motion.longitudinal !== "idle" ||
     motion.lateral !== "idle" ||
     motion.lookHorizontal !== "idle" ||
     motion.lookVertical !== "idle";
+
+  useEffect(() => {
+    if (providerKind !== "mock" || !isRunning) return;
+
+    let frameId = 0;
+    let lastTime = performance.now();
+
+    const step = (time: number) => {
+      const dt = Math.min((time - lastTime) / 1000, 0.05);
+      lastTime = time;
+      const currentMotion = motionRef.current;
+      const active =
+        currentMotion.longitudinal !== "idle" ||
+        currentMotion.lateral !== "idle" ||
+        currentMotion.lookHorizontal !== "idle" ||
+        currentMotion.lookVertical !== "idle";
+
+      if (active) {
+        const next = { ...cameraRef.current };
+
+        if (currentMotion.longitudinal === "forward") next.zoom += 0.2 * dt;
+        if (currentMotion.longitudinal === "back") next.zoom -= 0.18 * dt;
+        if (currentMotion.lateral === "strafe_left") next.x += 10 * dt;
+        if (currentMotion.lateral === "strafe_right") next.x -= 10 * dt;
+        if (currentMotion.lookHorizontal === "left") {
+          next.x += 14 * dt;
+          next.yaw -= 2.8 * dt;
+        }
+        if (currentMotion.lookHorizontal === "right") {
+          next.x -= 14 * dt;
+          next.yaw += 2.8 * dt;
+        }
+        if (currentMotion.lookVertical === "up") next.y += 9 * dt;
+        if (currentMotion.lookVertical === "down") next.y -= 9 * dt;
+
+        next.x = clamp(next.x, -12, 12);
+        next.y = clamp(next.y, -8, 8);
+        next.zoom = clamp(next.zoom, 1.05, 1.35);
+        next.yaw = clamp(next.yaw, -3, 3);
+
+        cameraRef.current = next;
+        setDemoCamera(next);
+      }
+
+      frameId = requestAnimationFrame(step);
+    };
+
+    frameId = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(frameId);
+  }, [providerKind, isRunning]);
+
+  const demoTransform = `translate3d(${demoCamera.x}%, ${demoCamera.y}%, 0) scale(${demoCamera.zoom}) rotate(${demoCamera.yaw}deg)`;
 
   const overlayLoading =
     worldStatus === "connecting" ||
@@ -83,10 +173,10 @@ export function WorldViewport({
       ) : (
         <div
           className={cn(
-            "absolute inset-0 transition-transform duration-500 ease-out",
+            "absolute inset-0 transition-transform duration-100 ease-out will-change-transform",
             !moving && isRunning && "animate-camera-breathe",
           )}
-          style={transform ? { transform } : undefined}
+          style={{ transform: demoTransform }}
         >
           <img
             src="/warehouse-seed.jpg"
@@ -154,8 +244,9 @@ export function WorldViewport({
 
       {overlayLoading && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/85">
-          <span className="label-tech animate-pulse">
-            {reactorLive ? "Connecting Reactor world..." : "Establishing world link..."}
+          <span className="label-tech animate-pulse text-center">
+            {startupMessage ??
+              (reactorLive ? "Waiting for Reactor video stream..." : "Establishing world link...")}
           </span>
         </div>
       )}
@@ -168,13 +259,24 @@ export function WorldViewport({
               {worldError ?? "The generated world could not be started."}
             </p>
             {onSwitchToDemo && providerKind === "reactor" && (
-              <button
-                type="button"
-                onClick={onSwitchToDemo}
-                className="mt-4 rounded bg-primary px-4 py-2 font-display text-sm uppercase tracking-widest text-primary-foreground"
-              >
-                Switch to Demo Mode
-              </button>
+              <div className="mt-4 flex flex-wrap justify-center gap-2">
+                {onRetryLiveWorld && (
+                  <button
+                    type="button"
+                    onClick={onRetryLiveWorld}
+                    className="rounded bg-primary px-4 py-2 font-display text-sm uppercase tracking-widest text-primary-foreground"
+                  >
+                    Retry Live World
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={onSwitchToDemo}
+                  className="rounded border border-border px-4 py-2 font-display text-sm uppercase tracking-widest"
+                >
+                  Switch to Demo Mode
+                </button>
+              </div>
             )}
           </div>
         </div>
