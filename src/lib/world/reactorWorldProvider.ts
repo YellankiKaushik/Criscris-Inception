@@ -16,18 +16,23 @@ const SEED_PATH = "/warehouse-seed.jpg";
 const SEED_UPLOAD_RETRY_MS = 750;
 const SEED_UPLOAD_READY_TIMEOUT_MS = 105_000;
 const REACTOR_ACK_TIMEOUT_MS = 40_000;
-const REACTOR_MAIN_VIDEO_TIMEOUT_MS = 30_000;
-const REACTOR_CONNECT_RETRY_DELAYS_MS = [3_000, 6_000, 10_000] as const;
+const REACTOR_MAIN_VIDEO_TIMEOUT_MS = 60_000;
+const REACTOR_CONNECT_RETRY_DELAYS_MS = [3_000, 6_000, 10_000, 15_000, 20_000] as const;
 const REACTOR_CAPACITY_ERROR_MESSAGE =
-  "Reactor is currently at capacity. Try again shortly or switch to Demo Mode.";
+  "Reactor is currently at capacity. Retry Live World shortly or switch to Demo Mode.";
 const REACTOR_MAIN_VIDEO_ERROR_MESSAGE =
-  "Reactor started the world but no video stream became available. Try again or switch to Demo Mode.";
+  "Reactor started the world, but the video stream did not become available. Retry Live World or switch to Demo Mode.";
 
 type PendingReactorAck = {
   promise: Promise<void>;
   timeoutId: ReturnType<typeof setTimeout>;
   resolve: () => void;
   reject: (error: Error) => void;
+};
+
+type ConnectedReactorModel = {
+  model: LingbotWorld2Model;
+  unsubscribers: Array<() => void>;
 };
 
 const idleMotion = (): WorldMotion => ({
@@ -94,12 +99,10 @@ function isReactorCapacityError(error: unknown): boolean {
   );
 }
 
-function isUsableMainVideoStream(track: MediaStreamTrack, stream: MediaStream): boolean {
-  return (
-    track.kind === "video" &&
-    track.readyState !== "ended" &&
-    stream.getVideoTracks().some((videoTrack) => videoTrack.id === track.id)
-  );
+function debugReactorLifecycle(message: string): void {
+  if (import.meta.env.DEV) {
+    console.info(`[Criscris/Reactor] ${message}`);
+  }
 }
 
 async function uploadSeedWhenReady(model: LingbotWorld2Model, seed: File): Promise<ReactorFileRef> {
@@ -141,18 +144,46 @@ async function disconnectQuietly(model: LingbotWorld2Model): Promise<void> {
   }
 }
 
+function cleanupModelListeners(unsubscribers: Array<() => void>): void {
+  for (const off of unsubscribers) {
+    try {
+      off();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 async function connectModelWithCapacityRetry(
   createModel: () => LingbotWorld2Model,
   jwt: string,
-): Promise<LingbotWorld2Model> {
+  onProgress: (message: string | null) => void,
+  bindCandidate: (model: LingbotWorld2Model) => Array<() => void>,
+  onAttemptModel: (model: LingbotWorld2Model) => void,
+  shouldContinue: () => boolean,
+): Promise<ConnectedReactorModel> {
   const maxAttempts = REACTOR_CONNECT_RETRY_DELAYS_MS.length + 1;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (!shouldContinue()) {
+      throw new Error("World provider already disposed.");
+    }
+
     const model = createModel();
+    onAttemptModel(model);
+    const candidateUnsubscribers = bindCandidate(model);
+    debugReactorLifecycle("listeners bound before connect");
     try {
+      onProgress(`Connecting world session... Attempt ${attempt} of ${maxAttempts}.`);
       await model.connect(jwt);
-      return model;
+      if (!shouldContinue()) {
+        cleanupModelListeners(candidateUnsubscribers);
+        await disconnectQuietly(model);
+        throw new Error("World provider already disposed.");
+      }
+      return { model, unsubscribers: candidateUnsubscribers };
     } catch (error) {
+      cleanupModelListeners(candidateUnsubscribers);
       await disconnectQuietly(model);
       if (!isReactorCapacityError(error)) {
         throw error;
@@ -162,6 +193,9 @@ async function connectModelWithCapacityRetry(
         throw new Error(REACTOR_CAPACITY_ERROR_MESSAGE);
       }
 
+      onProgress(
+        `Reactor capacity is busy. Retrying live world... Attempt ${attempt + 1} of ${maxAttempts}.`,
+      );
       if (import.meta.env.DEV) {
         console.info(
           `[Criscris/Reactor] capacity unavailable; retry ${attempt + 1}/${maxAttempts}`,
@@ -200,6 +234,7 @@ export class ReactorWorldProvider implements WorldProvider {
   private statusListeners = new Set<(status: WorldStatus, error: string | null) => void>();
   private motionListeners = new Set<(motion: WorldMotion) => void>();
   private videoListeners = new Set<(stream: MediaStream | null) => void>();
+  private progressListeners = new Set<(message: string | null) => void>();
   private unsubscribers: Array<() => void> = [];
 
   private setStatus(status: WorldStatus, error: string | null = null) {
@@ -215,6 +250,10 @@ export class ReactorWorldProvider implements WorldProvider {
   private emitVideo(stream: MediaStream | null) {
     this.stream = stream;
     for (const l of this.videoListeners) l(stream);
+  }
+
+  private setProgress(message: string | null) {
+    for (const l of this.progressListeners) l(message);
   }
 
   private waitForConditionsReady(): Promise<void> {
@@ -297,6 +336,7 @@ export class ReactorWorldProvider implements WorldProvider {
         if (this.pendingMainVideoReady === pending) {
           this.pendingMainVideoReady = null;
         }
+        debugReactorLifecycle("video timeout");
         reject(new Error(REACTOR_MAIN_VIDEO_ERROR_MESSAGE));
       }, REACTOR_MAIN_VIDEO_TIMEOUT_MS);
       pending.resolve = () => resolve();
@@ -328,17 +368,22 @@ export class ReactorWorldProvider implements WorldProvider {
     this.rejectPendingMainVideoReady(error);
   }
 
-  private bindModel(model: LingbotWorld2Model) {
-    this.unsubscribers.push(
-      model.onMainVideo((track, stream) => {
+  private bindModel(model: LingbotWorld2Model): Array<() => void> {
+    const unsubscribers: Array<() => void> = [];
+    let firstChunkLogged = false;
+
+    unsubscribers.push(
+      model.onMainVideo((_track, stream) => {
+        debugReactorLifecycle("main video callback");
+        if (!stream) return;
         this.emitVideo(stream);
-        if (isUsableMainVideoStream(track, stream)) {
-          this.mainVideoReady = true;
-          this.resolvePendingMainVideoReady();
-        }
+        this.mainVideoReady = true;
+        this.setProgress("Live world ready.");
+        debugReactorLifecycle("main video accepted");
+        this.resolvePendingMainVideoReady();
       }),
     );
-    this.unsubscribers.push(
+    unsubscribers.push(
       model.onCommandError((msg) => {
         const command = typeof msg.command === "string" ? msg.command : "unknown";
         const reason = typeof msg.reason === "string" ? msg.reason : "";
@@ -361,34 +406,44 @@ export class ReactorWorldProvider implements WorldProvider {
         this.setStatus("error", safeMessage);
       }),
     );
-    this.unsubscribers.push(
+    unsubscribers.push(
       model.onGenerationStarted(() => {
         this.generationStarted = true;
         this.resolvePendingGenerationStarted();
+        this.setProgress("Waiting for Reactor video stream...");
+        debugReactorLifecycle("generation started");
         this.setStatus("generating");
       }),
     );
-    this.unsubscribers.push(
+    unsubscribers.push(
       model.onGenerationPaused(() => {
         this.setStatus("paused");
       }),
     );
-    this.unsubscribers.push(
+    unsubscribers.push(
       model.onGenerationResumed(() => {
         this.setStatus("generating");
       }),
     );
-    this.unsubscribers.push(model.onImageAccepted(() => undefined));
-    this.unsubscribers.push(model.onPromptAccepted(() => undefined));
-    this.unsubscribers.push(
+    unsubscribers.push(model.onImageAccepted(() => undefined));
+    unsubscribers.push(model.onPromptAccepted(() => undefined));
+    unsubscribers.push(
       model.onConditionsReady((msg) => {
         this.conditionsReady = msg.has_image && msg.has_prompt;
         if (this.conditionsReady) {
+          debugReactorLifecycle("conditions ready");
           this.resolvePendingConditionsReady();
         }
       }),
     );
-    this.unsubscribers.push(model.onChunkComplete(() => undefined));
+    unsubscribers.push(
+      model.onChunkComplete(() => {
+        if (firstChunkLogged) return;
+        firstChunkLogged = true;
+        debugReactorLifecycle("first chunk complete");
+      }),
+    );
+    return unsubscribers;
   }
 
   async initialize(input: { initialPrompt: string; seedImage?: Blob }): Promise<void> {
@@ -401,6 +456,7 @@ export class ReactorWorldProvider implements WorldProvider {
     }
     this.prompt = input.initialPrompt;
     this.setStatus("connecting");
+    this.setProgress("Requesting live world...");
 
     this.initPromise = this.connectAndArm(input);
     try {
@@ -421,19 +477,34 @@ export class ReactorWorldProvider implements WorldProvider {
     let model = this.model;
     this.mainVideoReady = false;
     this.emitVideo(null);
+    debugReactorLifecycle("live attempt created");
 
     if (!model || !this.connected) {
+      this.setProgress("Requesting live world...");
       const jwt = await fetchReactorJwt();
-      model = await connectModelWithCapacityRetry(() => new LingbotWorld2Model(), jwt);
+      const connectedModel = await connectModelWithCapacityRetry(
+        () => new LingbotWorld2Model(),
+        jwt,
+        (message) => this.setProgress(message),
+        (candidate) => this.bindModel(candidate),
+        (attemptModel) => {
+          this.model = attemptModel;
+        },
+        () => !this.disposed,
+      );
+      model = connectedModel.model;
       this.model = model;
-      this.bindModel(model);
+      this.unsubscribers.push(...connectedModel.unsubscribers);
       this.connected = true;
+      debugReactorLifecycle("connected");
     }
 
+    this.setProgress("Uploading environment seed...");
     const seed = await loadSeedFile(input.seedImage);
     const fileRef = await uploadSeedWhenReady(model, seed);
     this.conditionsReady = false;
     this.generationStarted = false;
+    this.setProgress("Preparing scenario...");
     await model.setImage({ image: fileRef });
     await model.setPrompt({ prompt: input.initialPrompt });
     await this.waitForConditionsReady();
@@ -446,16 +517,19 @@ export class ReactorWorldProvider implements WorldProvider {
       throw new Error("World model is not initialized.");
     }
     this.generationStarted = false;
+    this.setProgress("Starting world model...");
     const generationStarted = this.waitForGenerationStarted();
-    const mainVideoReady = this.waitForMainVideoReady();
     try {
+      debugReactorLifecycle("start sent");
       await this.model.start();
     } catch {
       const error = new Error(safeCommandMessage("start", ""));
       this.rejectPendingGenerationStarted(error);
       this.rejectPendingMainVideoReady(error);
     }
-    await Promise.all([generationStarted, mainVideoReady]);
+    await generationStarted;
+    await this.waitForMainVideoReady();
+    this.setProgress(null);
   }
 
   async setScenarioPrompt(prompt: string): Promise<void> {
@@ -510,6 +584,7 @@ export class ReactorWorldProvider implements WorldProvider {
     this.lastPrompt = "";
     await this.model?.reset();
     this.initPromise = null;
+    this.setProgress(null);
     this.setStatus("idle");
   }
 
@@ -542,6 +617,7 @@ export class ReactorWorldProvider implements WorldProvider {
     this.statusListeners.clear();
     this.motionListeners.clear();
     this.videoListeners.clear();
+    this.progressListeners.clear();
     this.status = "idle";
   }
 
@@ -580,6 +656,14 @@ export class ReactorWorldProvider implements WorldProvider {
     listener(this.stream);
     return () => {
       this.videoListeners.delete(listener);
+    };
+  }
+
+  onProgressChange(listener: (message: string | null) => void): () => void {
+    this.progressListeners.add(listener);
+    listener(null);
+    return () => {
+      this.progressListeners.delete(listener);
     };
   }
 }
